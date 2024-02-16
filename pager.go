@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-
-	"github.com/edsrzf/mmap-go"
 )
 
 var bin = binary.BigEndian
@@ -25,29 +23,24 @@ var ErrReadOnly = errors.New("read-only")
 
 // Open opens the named file and returns a pager instance for it. If the file
 // doesn't exist, it will be created if not in read-only mode.
-func Open(fileName string, blockSz int, readOnly bool, mode os.FileMode) (*Pager, error) {
+func Open(fileName string, blockSz int, mode os.FileMode) (*Pager, error) {
 	if fileName == InMemoryFileName {
-		return newPager(&inMemory{}, fileName, blockSz, readOnly, 0)
+		return newPager(&inMemory{}, fileName, blockSz)
 	}
 
-	mmapFlag := mmap.RDWR
 	flag := os.O_CREATE | os.O_RDWR
-	if readOnly {
-		mmapFlag = mmap.RDONLY
-		flag = os.O_RDONLY
-	}
 
 	f, err := os.OpenFile(fileName, flag, mode)
 	if err != nil {
 		return nil, err
 	}
 
-	return newPager(f, fileName, blockSz, readOnly, mmapFlag)
+	return newPager(f, fileName, blockSz)
 }
 
 // newPager creates an instance of pager for given random access file object.
 // By default page size is set to the current system page size.
-func newPager(file RandomAccessFile, fileName string, pageSize int, readOnly bool, mmapFlag int) (*Pager, error) {
+func newPager(file RandomAccessFile, fileName string, pageSize int) (*Pager, error) {
 	size, err := findSize(file)
 	if err != nil {
 		return nil, err
@@ -59,19 +52,10 @@ func newPager(file RandomAccessFile, fileName string, pageSize int, readOnly boo
 		file:     file,
 		fileName: fileName,
 		fileSize: size,
-		readOnly: readOnly,
 		pageSize: pageSize,
 		osFile:   osFile,
-		mmapFlag: mmapFlag,
 	}
 	p.computeCount()
-
-	if size > 0 {
-		if err := p.mmap(); err != nil {
-			_ = p.Close()
-			return nil, err
-		}
-	}
 
 	return p, nil
 }
@@ -89,9 +73,7 @@ type Pager struct {
 	readOnly bool
 
 	// memory mapping state for os.File
-	osFile   *os.File
-	data     mmap.MMap
-	mmapFlag int
+	osFile *os.File
 
 	// i/o tracking
 	writes int
@@ -110,7 +92,6 @@ func (p *Pager) Alloc(n int) (uint64, error) {
 
 	nextID := p.count
 
-	_ = p.unmap()
 	targetSize := p.fileSize + int64(n*p.pageSize)
 	if err := p.file.Truncate(targetSize); err != nil {
 		return 0, err
@@ -120,7 +101,7 @@ func (p *Pager) Alloc(n int) (uint64, error) {
 	p.computeCount()
 
 	p.allocs++
-	return nextID, p.mmap()
+	return nextID, nil
 }
 
 // Free deallocates 'n' sequential pages from end of file
@@ -136,7 +117,6 @@ func (p *Pager) Free(n int) error {
 	}
 	targetSize := p.fileSize - int64(n*p.pageSize)
 
-	_ = p.unmap()
 	if err := p.file.Truncate(targetSize); err != nil {
 		return err
 	}
@@ -144,7 +124,7 @@ func (p *Pager) Free(n int) error {
 	p.fileSize = targetSize
 	p.computeCount()
 
-	return p.mmap()
+	return nil
 }
 
 // Read reads one page of data from the underlying file or mmapped region if
@@ -157,14 +137,6 @@ func (p *Pager) Read(id uint64) ([]byte, error) {
 	}
 
 	buf := make([]byte, p.pageSize)
-	if p.data != nil {
-		n := copy(buf, p.data[p.offset(id):])
-		if n < p.pageSize {
-			return nil, io.EOF
-		}
-		p.reads++
-		return buf, nil
-	}
 
 	n, err := p.file.ReadAt(buf, p.offset(id))
 	if n < p.pageSize {
@@ -180,16 +152,6 @@ func (p *Pager) ReadAt(dst []byte, offset uint64) error {
 		return fmt.Errorf("invalid file offset (filesize=%d, offset=%d)", p.fileSize, offset)
 	} else if p.file == nil {
 		return os.ErrClosed
-	}
-
-	if p.data != nil {
-		n := copy(dst, p.data[offset:])
-		if n < len(dst) {
-			return io.EOF
-		}
-
-		p.reads++
-		return nil
 	}
 
 	n, err := p.file.ReadAt(dst, int64(offset))
@@ -216,12 +178,6 @@ func (p *Pager) Write(id uint64, d []byte) error {
 		return ErrReadOnly
 	}
 
-	if p.data != nil {
-		copy(p.data[p.offset(id):], d)
-		p.writes++
-		return nil
-	}
-
 	_, err := p.file.WriteAt(d, p.offset(id))
 	if err != nil {
 		return err
@@ -238,12 +194,6 @@ func (p *Pager) WriteAt(src []byte, offset uint64) error {
 		return os.ErrClosed
 	} else if p.readOnly {
 		return ErrReadOnly
-	}
-
-	if p.data != nil {
-		copy(p.data[offset:], src)
-		p.writes++
-		return nil
 	}
 
 	n, err := p.file.WriteAt(src, int64(offset))
@@ -296,7 +246,7 @@ func (p *Pager) Close() error {
 	if p.file == nil {
 		return nil
 	}
-	_ = p.unmap()
+
 	err := p.file.Close()
 	p.osFile = nil
 	p.file = nil
@@ -318,8 +268,8 @@ func (p *Pager) String() string {
 	}
 
 	return fmt.Sprintf(
-		"Pager{file='%s', readOnly=%t, pageSize=%d, count=%d, mmap=%t}",
-		p.file.Name(), p.readOnly, p.pageSize, p.count, p.data != nil,
+		"Pager{file='%s', readOnly=%t, pageSize=%d, count=%d}",
+		p.file.Name(), p.readOnly, p.pageSize, p.count,
 	)
 }
 
@@ -329,30 +279,6 @@ func (p *Pager) computeCount() {
 
 func (p *Pager) offset(id uint64) int64 {
 	return int64(uint64(p.pageSize) * id)
-}
-
-func (p *Pager) mmap() error {
-	if disableMmap || p.osFile == nil || p.file == nil || p.fileSize <= 0 {
-		return nil
-	}
-
-	if err := p.unmap(); err != nil {
-		return err
-	}
-
-	d, err := mmap.Map(p.osFile, p.mmapFlag, 0)
-	if err != nil {
-		return err
-	}
-	p.data = d
-	return nil
-}
-
-func (p *Pager) unmap() error {
-	if p.osFile == nil || p.data == nil {
-		return nil
-	}
-	return p.data.Unmap()
 }
 
 // Stats represents I/O statistics collected by the pager.

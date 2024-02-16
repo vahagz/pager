@@ -13,7 +13,7 @@ func TestPager(t *testing.T) {
 	require.NoError(t, os.Remove(filename))
 	defer os.Remove(filename)
 
-	p, err := Open(filename, os.Getpagesize(), false, 0644)
+	p, err := Open(filename, os.Getpagesize(), 0644)
 	require.NoError(t, err)
 
 	id, err := p.Alloc(1)
